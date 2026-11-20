@@ -1,5 +1,9 @@
 import sys
+import os
+import time
+import logging
 import threading
+from pathlib import Path
 from collections import deque
 
 import mss
@@ -18,10 +22,26 @@ from PySide6.QtWidgets import (
 
 APP_NAME = "RobRun Translator HUD"
 
+def configure_logging():
+    base_dir = Path(os.environ.get("LOCALAPPDATA", str(Path.home())))
+    log_dir = base_dir / "RobRunTranslatorHUD"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / "app.log"
+    logging.basicConfig(
+        filename=str(log_file),
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        encoding="utf-8",
+    )
+    return log_file
+
+LOG_PATH = configure_logging()
+
 
 class WorkerSignals(QObject):
     result = Signal(str, str)
     error = Signal(str)
+    info = Signal(str)
     pause_hotkey = Signal()
     select_hotkey = Signal()
     visibility_hotkey = Signal()
@@ -91,6 +111,7 @@ class Hud(QWidget):
         self.region = None
         self.paused = False
         self.busy = False
+        self.error_retry_after = 0.0
         self.last_source = ""
         self.history = deque(maxlen=30)
         self.ocr = None
@@ -102,6 +123,7 @@ class Hud(QWidget):
         self.signals = WorkerSignals()
         self.signals.result.connect(self.show_translation)
         self.signals.error.connect(self.show_error)
+        self.signals.info.connect(self.set_scan_status)
         self.signals.pause_hotkey.connect(self.toggle_pause)
         self.signals.select_hotkey.connect(self.select_region)
         self.signals.visibility_hotkey.connect(self.toggle_hud)
@@ -309,15 +331,23 @@ class Hud(QWidget):
     def scan(self):
         if self.paused or self.busy or self.region is None:
             return
+        if time.monotonic() < self.error_retry_after:
+            return
         self.busy = True
         threading.Thread(target=self._scan_worker, daemon=True).start()
 
     def _scan_worker(self):
+        stage = "Khởi tạo mô hình OCR"
         try:
             if self.ocr is None:
                 self.ocr = RapidOCR()
+                logging.info("OCR model initialized successfully")
 
+            stage = "Chụp vùng màn hình đã chọn"
             region = self.region
+            if region is None or region.width() < 10 or region.height() < 10:
+                raise ValueError("Vùng nhận diện không hợp lệ. Hãy nhấn F7 và chọn lại vùng chữ.")
+
             box = {
                 "left": region.x(),
                 "top": region.y(),
@@ -328,6 +358,7 @@ class Hud(QWidget):
                 shot = screen_capture.grab(box)
                 image = Image.frombytes("RGB", shot.size, shot.rgb)
 
+            stage = "Nhận diện chữ bằng OCR"
             result, _ = self.ocr(np.array(image))
             lines = []
             if result:
@@ -338,13 +369,27 @@ class Hud(QWidget):
                             lines.append(clean)
 
             source_text = " ".join(lines).strip()
-            if source_text and source_text != self.last_source and len(source_text) > 1:
-                translated = self.translator.translate(source_text)
-                if translated:
-                    self.last_source = source_text
-                    self.signals.result.emit(source_text, translated)
+            if not source_text or len(source_text) <= 1:
+                self.signals.info.emit("● ĐANG QUÉT • CHƯA THẤY CHỮ")
+                return
+
+            if source_text == self.last_source:
+                return
+
+            stage = "Dịch tiếng Anh sang tiếng Việt qua Internet"
+            translated = self.translator.translate(source_text)
+            if not translated:
+                raise RuntimeError("Google Translate không trả về bản dịch.")
+
+            self.last_source = source_text
+            self.error_retry_after = 0.0
+            logging.info("Translated OCR text successfully: %s", source_text[:180])
+            self.signals.result.emit(source_text, translated)
         except Exception as error:
-            self.signals.error.emit(str(error))
+            detail = f"{stage}: {type(error).__name__}: {error}"
+            logging.exception("Processing failed at stage: %s", stage)
+            self.error_retry_after = time.monotonic() + 8.0
+            self.signals.error.emit(detail)
         finally:
             self.busy = False
 
@@ -358,12 +403,23 @@ class Hud(QWidget):
         )
 
     def show_error(self, error):
-        self.status.setText("● LỖI OCR / KẾT NỐI")
+        self.status.setText("● CÓ LỖI — XEM CHI TIẾT")
         self.status.setStyleSheet(
             "color:#ff7979;font-size:10px;font-weight:700;"
         )
-        self.translation.setText(
-            "Không thể xử lý. Kiểm tra Internet hoặc khởi động lại ứng dụng."
+        self.original.setText("EN  Chương trình đã dừng ở bước xử lý có lỗi")
+        self.translation.setStyleSheet(
+            "color:#ffb0b0;font-size:13px;font-weight:700;"
+        )
+        self.translation.setText("LỖI CỤ THỂ: " + error[:320])
+        self.translation.setToolTip(
+            error + "\n\nNhật ký đầy đủ: " + str(LOG_PATH)
+        )
+
+    def set_scan_status(self, status):
+        self.status.setText(status)
+        self.status.setStyleSheet(
+            "color:#55efb0;font-size:10px;font-weight:700;"
         )
 
     def closeEvent(self, event):
