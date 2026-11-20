@@ -395,6 +395,10 @@ class Hud(QWidget):
 
     def show_translation(self, source, translated):
         self.original.setText("EN  " + source)
+        self.translation.setStyleSheet(
+            "color:#ffffff;font-size:19px;font-weight:700;"
+        )
+        self.translation.setToolTip("")
         self.translation.setText("VI  " + translated)
         self.history.append((source, translated))
         self.status.setText("● ĐÃ DỊCH")
