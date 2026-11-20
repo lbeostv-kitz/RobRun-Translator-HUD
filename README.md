@@ -29,6 +29,17 @@ Khi tạo tag phiên bản dạng `v1.0.0`, workflow còn tự tạo GitHub Rele
 - **F8**: Ẩn / hiện HUD.
 - **F9**: Xóa nội dung hiện tại.
 
+## Chống giới hạn dịch
+
+- Chỉ gửi dịch khi OCR đọc được cùng một nội dung trong ít nhất 2 lần quét liên tiếp.
+- Khoảng cách tối thiểu giữa hai yêu cầu Google Translate là 6 giây.
+- Lưu bộ nhớ đệm tối đa 500 câu đã dịch vào máy để không gửi lại câu cũ.
+- Giới hạn an toàn 160 yêu cầu dịch mỗi ngày trên máy này; bộ đếm tự đặt lại theo ngày.
+- Khi Google trả lỗi TooManyRequests, ứng dụng tạm ngừng gọi dịch 5 phút.
+- OCR quét mỗi 1,4 giây; việc đọc chữ vẫn chạy cục bộ.
+
+Dữ liệu bộ nhớ đệm và bộ đếm được lưu tại `%LOCALAPPDATA%\\RobRunTranslatorHUD\\state.json`.
+
 ## Công nghệ và quyền riêng tư
 
 - OCR chạy cục bộ trên máy.
