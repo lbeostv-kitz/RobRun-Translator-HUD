@@ -2,6 +2,7 @@ import sys
 import os
 import time
 import logging
+import json
 import threading
 from pathlib import Path
 from collections import deque
@@ -113,6 +114,17 @@ class Hud(QWidget):
         self.busy = False
         self.error_retry_after = 0.0
         self.last_source = ""
+        self.last_source_key = ""
+        self.candidate_source = ""
+        self.candidate_count = 0
+        self.min_request_interval = 6.0
+        self.daily_request_limit = 160
+        self.last_request_at = 0.0
+        self.translation_cache = {}
+        self.daily_request_count = 0
+        self.daily_counter_date = time.strftime("%Y-%m-%d")
+        self.state_path = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "RobRunTranslatorHUD" / "state.json"
+        self.load_state()
         self.history = deque(maxlen=30)
         self.ocr = None
         self.translator = GoogleTranslator(source="en", target="vi")
@@ -134,7 +146,7 @@ class Hud(QWidget):
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.scan)
-        self.timer.start(800)
+        self.timer.start(1400)
 
         self.start_global_hotkeys()
 
@@ -327,6 +339,59 @@ class Hud(QWidget):
         self.original.setText("EN  Chưa có nội dung được nhận diện")
         self.translation.setText("VI  Bản dịch tiếng Việt sẽ hiển thị tại đây")
         self.last_source = ""
+        self.last_source_key = ""
+
+    def normalize_source(self, text):
+        return " ".join((text or "").split()).casefold()
+
+    def load_state(self):
+        try:
+            if self.state_path.exists():
+                data = json.loads(self.state_path.read_text(encoding="utf-8"))
+                self.translation_cache = data.get("cache", {})
+                today = time.strftime("%Y-%m-%d")
+                if data.get("date") == today:
+                    self.daily_request_count = int(data.get("request_count", 0))
+                    self.last_request_at = float(data.get("last_request_at", 0.0))
+                else:
+                    self.daily_counter_date = today
+                    self.daily_request_count = 0
+                    self.last_request_at = 0.0
+                logging.info(
+                    "Loaded translation cache (%d entries); daily requests=%d",
+                    len(self.translation_cache), self.daily_request_count
+                )
+        except Exception:
+            logging.exception("Could not load app state")
+            self.translation_cache = {}
+            self.daily_request_count = 0
+            self.last_request_at = 0.0
+
+    def save_state(self):
+        try:
+            self.state_path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "date": self.daily_counter_date,
+                "request_count": self.daily_request_count,
+                "last_request_at": self.last_request_at,
+                "cache": self.translation_cache,
+            }
+            temp_path = self.state_path.with_suffix(".tmp")
+            temp_path.write_text(
+                json.dumps(payload, ensure_ascii=False),
+                encoding="utf-8"
+            )
+            temp_path.replace(self.state_path)
+        except Exception:
+            logging.exception("Could not save app state")
+
+    def refresh_daily_counter(self):
+        today = time.strftime("%Y-%m-%d")
+        if today != self.daily_counter_date:
+            self.daily_counter_date = today
+            self.daily_request_count = 0
+            self.last_request_at = 0.0
+            self.save_state()
 
     def scan(self):
         if self.paused or self.busy or self.region is None:
@@ -370,25 +435,77 @@ class Hud(QWidget):
 
             source_text = " ".join(lines).strip()
             if not source_text or len(source_text) <= 1:
+                self.candidate_source = ""
+                self.candidate_count = 0
                 self.signals.info.emit("● ĐANG QUÉT • CHƯA THẤY CHỮ")
                 return
 
-            if source_text == self.last_source:
+            source_key = self.normalize_source(source_text)
+            if source_key != self.candidate_source:
+                self.candidate_source = source_key
+                self.candidate_count = 1
+                self.signals.info.emit("● ĐANG QUÉT • CHỜ CHỮ ỔN ĐỊNH")
+                return
+
+            self.candidate_count += 1
+            if self.candidate_count < 2:
+                return
+
+            if source_key == self.last_source_key:
+                return
+
+            cached_translation = self.translation_cache.get(source_key)
+            if cached_translation:
+                self.last_source = source_text
+                self.last_source_key = source_key
+                self.signals.result.emit(source_text, cached_translation)
+                return
+
+            self.refresh_daily_counter()
+            if self.daily_request_count >= self.daily_request_limit:
+                raise RuntimeError(
+                    f"Đã đạt giới hạn an toàn {self.daily_request_limit} lượt dịch/ngày. "
+                    "Bộ đếm sẽ tự đặt lại vào ngày mai; các câu đã dịch vẫn dùng được từ bộ nhớ đệm."
+                )
+
+            now = time.time()
+            elapsed = now - self.last_request_at
+            if elapsed < self.min_request_interval:
+                remaining = max(1, int(self.min_request_interval - elapsed))
+                self.signals.info.emit(f"● ĐỢI {remaining} GIÂY • CHỐNG GIỚI HẠN DỊCH")
                 return
 
             stage = "Dịch tiếng Anh sang tiếng Việt qua Internet"
+            # Persist the request time/count before calling the remote service.
+            self.last_request_at = now
+            self.daily_request_count += 1
+            self.save_state()
+
             translated = self.translator.translate(source_text)
             if not translated:
                 raise RuntimeError("Google Translate không trả về bản dịch.")
 
+            self.translation_cache[source_key] = translated
+            if len(self.translation_cache) > 500:
+                self.translation_cache = dict(list(self.translation_cache.items())[-500:])
+
             self.last_source = source_text
+            self.last_source_key = source_key
             self.error_retry_after = 0.0
+            self.save_state()
             logging.info("Translated OCR text successfully: %s", source_text[:180])
             self.signals.result.emit(source_text, translated)
         except Exception as error:
-            detail = f"{stage}: {type(error).__name__}: {error}"
+            raw_error = str(error)
+            detail = f"{stage}: {type(error).__name__}: {raw_error}"
             logging.exception("Processing failed at stage: %s", stage)
-            self.error_retry_after = time.monotonic() + 8.0
+            if "TooManyRequests" in raw_error or "too many requests" in raw_error.lower():
+                self.error_retry_after = time.monotonic() + 300.0
+                detail += " | Google đang giới hạn lượt dịch. Ứng dụng sẽ tạm dừng gọi dịch trong 5 phút."
+            elif "Đã đạt giới hạn an toàn" in raw_error:
+                self.error_retry_after = time.monotonic() + 300.0
+            else:
+                self.error_retry_after = time.monotonic() + 8.0
             self.signals.error.emit(detail)
         finally:
             self.busy = False
